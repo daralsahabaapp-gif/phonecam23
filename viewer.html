@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="ar" dir="rtl"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>المشاهدة — PhoneCam</title><link rel="stylesheet" href="style.css"></head>
+<body>
+<h1>مشاهدة البث</h1>
+<div id="join" class="card">
+  <input type="text" id="room" maxlength="8" placeholder="كود الكاميرا" autocomplete="off" autocapitalize="characters">
+  <button class="btn primary" id="go">شاهد</button>
+</div>
+<div id="watch" class="hide">
+  <video id="video" autoplay playsinline muted></video>
+  <div class="status"><span class="dot" id="dot"></span><span id="status">جاري الاتصال…</span></div>
+  <div class="row">
+    <button class="btn" id="mute">تشغيل الصوت</button>
+    <button class="btn" id="full">ملء الشاشة</button>
+  </div>
+  <button class="btn danger" id="leave" style="margin-top:10px">خروج</button>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+let ws, pc, cfg, pending = [], left = false, room = '';
+const send = (o) => ws && ws.readyState === 1 && ws.send(JSON.stringify(o));
+function setStatus(t, s) { $('status').textContent = t; $('dot').className = 'dot ' + (s || ''); }
+
+const qs = new URLSearchParams(location.search).get('room');
+$('room').value = (qs || localStorage.viewRoom || '').toUpperCase();
+if (qs) setTimeout(() => $('go').click(), 0);
+
+$('go').onclick = async () => {
+  room = $('room').value.trim().toUpperCase();
+  if (room.length !== 8) return alert('الكود لازم يكون 8 حروف/أرقام.');
+  localStorage.viewRoom = room; left = false;
+  cfg = await (await fetch('/config')).json();
+  $('join').classList.add('hide'); $('watch').classList.remove('hide');
+  connect();
+};
+
+function connect() {
+  setStatus('جاري الاتصال…');
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host);
+  ws.onopen = () => send({ type: 'join', room });
+  ws.onmessage = async (ev) => {
+    const m = JSON.parse(ev.data);
+    if (m.type === 'joined') setStatus(m.online ? 'متصل بالكاميرا…' : 'الكاميرا غير متصلة حاليًا', m.online ? '' : 'err');
+    else if (m.type === 'error') { setStatus(m.reason === 'full' ? 'عدد المشاهدين وصل للحد الأقصى' : 'الكود غلط أو الكاميرا لم تبدأ بعد', 'err'); left = true; }
+    else if (m.type === 'camera-offline') { setStatus('الكاميرا انقطعت — في انتظار رجوعها', 'err'); closePc(); }
+    else if (m.type === 'offer') await onOffer(m.sdp);
+    else if (m.type === 'candidate' && m.candidate) {
+      if (pc && pc.remoteDescription) try { await pc.addIceCandidate(m.candidate); } catch {} else pending.push(m.candidate);
+    }
+  };
+  ws.onclose = () => { if (!left) { setStatus('انقطع الاتصال… بحاول تاني', 'err'); setTimeout(connect, 2000); } };
+}
+
+function closePc() { if (pc) { pc.close(); pc = null; } pending = []; $('video').srcObject = null; }
+
+async function onOffer(sdp) {
+  closePc();
+  pc = new RTCPeerConnection(cfg);
+  pc.ontrack = (e) => { $('video').srcObject = e.streams[0]; };
+  pc.onicecandidate = (e) => e.candidate && send({ type: 'candidate', candidate: e.candidate });
+  pc.onconnectionstatechange = () => {
+    if (pc.connectionState === 'connected') setStatus('بث مباشر', 'on');
+    else if (pc.connectionState === 'failed') setStatus('فشل الاتصال المباشر — غالبًا محتاج خادم TURN', 'err');
+  };
+  await pc.setRemoteDescription(sdp);
+  for (const c of pending) try { await pc.addIceCandidate(c); } catch {}
+  pending = [];
+  await pc.setLocalDescription(await pc.createAnswer());
+  send({ type: 'answer', sdp: pc.localDescription });
+}
+
+$('mute').onclick = () => { const v = $('video'); v.muted = !v.muted; $('mute').textContent = v.muted ? 'تشغيل الصوت' : 'كتم الصوت'; };
+$('full').onclick = () => { const v = $('video'); (v.requestFullscreen || v.webkitEnterFullscreen).call(v); };
+$('leave').onclick = () => { left = true; ws && ws.close(); closePc(); $('watch').classList.add('hide'); $('join').classList.remove('hide'); };
+</script>
+</body></html>

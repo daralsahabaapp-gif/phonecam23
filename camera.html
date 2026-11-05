@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="ar" dir="rtl"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>الكاميرا — PhoneCam</title><link rel="stylesheet" href="style.css"></head>
+<body>
+<h1>وضع الكاميرا</h1>
+<div id="setup" class="card">
+  <select id="facing"><option value="environment">الكاميرا الخلفية</option><option value="user">الكاميرا الأمامية</option></select>
+  <label class="opt"><input type="checkbox" id="audio"> تشغيل الصوت</label>
+  <select id="quality"><option value="480">جودة متوسطة (480p) — أقل استهلاك للنت</option><option value="720" selected>جودة عالية (720p)</option><option value="1080">جودة كاملة (1080p)</option></select>
+  <button class="btn primary" id="start" style="margin-top:12px">ابدأ البث</button>
+</div>
+<div id="live" class="hide">
+  <video id="preview" autoplay playsinline muted></video>
+  <div class="status"><span class="dot" id="dot"></span><span id="status">جاري الاتصال…</span></div>
+  <div class="card">
+    <div class="hint">كود المشاهدة</div>
+    <div class="code" id="code">--------</div>
+    <div class="row"><button class="btn" id="copy">نسخ الرابط</button><button class="btn" id="flip">قلب الكاميرا</button></div>
+    <p class="hint">المشاهدون الآن: <b id="count">0</b></p>
+  </div>
+  <button class="btn danger" id="stop">إيقاف البث</button>
+  <p class="hint">سيب الشاشة مفتوحة والموبايل على الشاحن. التطبيق بيمنع الشاشة من الإغلاق تلقائيًا.</p>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+let stream, ws, cfg, wake, stopped = false, facing = 'environment';
+const pcs = new Map();
+const key = localStorage.camKey || (localStorage.camKey = crypto.randomUUID());
+
+function setStatus(t, s) { $('status').textContent = t; $('dot').className = 'dot ' + (s || ''); }
+const send = (o) => ws && ws.readyState === 1 && ws.send(JSON.stringify(o));
+
+async function getStream(face) {
+  const h = +$('quality').value;
+  return navigator.mediaDevices.getUserMedia({
+    video: { facingMode: { ideal: face }, height: { ideal: h }, frameRate: { ideal: 24, max: 30 } },
+    audio: $('audio').checked
+  });
+}
+
+async function requestWake() {
+  try { wake = await navigator.wakeLock.request('screen'); } catch {}
+}
+document.addEventListener('visibilitychange', () => { if (!stopped && document.visibilityState === 'visible') requestWake(); });
+
+$('start').onclick = async () => {
+  if (!navigator.mediaDevices) return alert('لازم تفتح الموقع عبر HTTPS عشان الكاميرا تشتغل.');
+  try {
+    facing = $('facing').value;
+    stream = await getStream(facing);
+  } catch (e) { return alert('مقدرتش أفتح الكاميرا: ' + e.message); }
+  cfg = await (await fetch('/config')).json();
+  $('preview').srcObject = stream;
+  $('setup').classList.add('hide'); $('live').classList.remove('hide');
+  stopped = false; requestWake(); connect();
+};
+
+function connect() {
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host);
+  ws.onopen = () => send({ type: 'register', room: localStorage.camRoom, key });
+  ws.onmessage = async (ev) => {
+    const m = JSON.parse(ev.data);
+    if (m.type === 'registered') {
+      localStorage.camRoom = m.room; $('code').textContent = m.room;
+      setStatus('البث شغال — في انتظار مشاهد', 'on');
+    } else if (m.type === 'viewer-joined') startPeer(m.id);
+    else if (m.type === 'viewer-left') dropPeer(m.id);
+    else if (m.type === 'answer') { const pc = pcs.get(m.from); if (pc) await pc.setRemoteDescription(m.sdp); }
+    else if (m.type === 'candidate') { const pc = pcs.get(m.from); if (pc && m.candidate) try { await pc.addIceCandidate(m.candidate); } catch {} }
+  };
+  ws.onclose = () => {
+    if (stopped) return;
+    setStatus('انقطع الاتصال… بحاول تاني', 'err');
+    pcs.forEach((_, id) => dropPeer(id));
+    setTimeout(connect, 2000);
+  };
+}
+
+async function startPeer(id) {
+  dropPeer(id);
+  const pc = new RTCPeerConnection(cfg);
+  pcs.set(id, pc);
+  stream.getTracks().forEach((t) => pc.addTrack(t, stream));
+  pc.onicecandidate = (e) => e.candidate && send({ type: 'candidate', to: id, candidate: e.candidate });
+  pc.onconnectionstatechange = () => {
+    if (['failed', 'closed'].includes(pc.connectionState)) dropPeer(id);
+    updateCount();
+  };
+  await pc.setLocalDescription(await pc.createOffer());
+  send({ type: 'offer', to: id, sdp: pc.localDescription });
+}
+
+function dropPeer(id) { const pc = pcs.get(id); if (pc) { pc.close(); pcs.delete(id); } updateCount(); }
+function updateCount() { $('count').textContent = pcs.size; }
+
+$('flip').onclick = async () => {
+  facing = facing === 'environment' ? 'user' : 'environment';
+  try {
+    const ns = await getStream(facing);
+    const vt = ns.getVideoTracks()[0];
+    pcs.forEach((pc) => pc.getSenders().forEach((s) => s.track && s.track.kind === 'video' && s.replaceTrack(vt)));
+    stream.getVideoTracks().forEach((t) => { stream.removeTrack(t); t.stop(); });
+    stream.addTrack(vt); $('preview').srcObject = stream;
+  } catch (e) { alert('تعذر قلب الكاميرا: ' + e.message); }
+};
+
+$('copy').onclick = async () => {
+  const url = location.origin + '/viewer.html?room=' + localStorage.camRoom;
+  try { await navigator.clipboard.writeText(url); $('copy').textContent = 'تم النسخ ✓'; } catch { prompt('انسخ الرابط:', url); }
+  setTimeout(() => ($('copy').textContent = 'نسخ الرابط'), 1500);
+};
+
+$('stop').onclick = () => {
+  stopped = true; ws && ws.close(); pcs.forEach((_, id) => dropPeer(id));
+  stream && stream.getTracks().forEach((t) => t.stop()); wake && wake.release().catch(() => {});
+  $('live').classList.add('hide'); $('setup').classList.remove('hide');
+};
+</script>
+</body></html>
